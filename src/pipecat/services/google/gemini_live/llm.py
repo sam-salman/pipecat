@@ -818,6 +818,11 @@ class GeminiLiveLLMService(LLMService):
         self._http_options = update_google_client_http_options(http_options)
         self._session: AsyncSession = None
         self._connection_task = None
+        # Monotonic id incremented on every _connect(). Each connection task
+        # captures the generation it was started with so a superseded/cancelled
+        # task (e.g. after a settings-change reconnect) cannot trigger its own
+        # competing reconnect and create a reconnect/interruption storm.
+        self._connection_generation = 0
 
         self._disconnecting = False
         self._session_ready_event = asyncio.Event()
@@ -1391,13 +1396,19 @@ class GeminiLiveLLMService(LLMService):
                 logger.debug(f"Setting tools: {tools}")
                 config.tools = tools
 
-            # Start the connection
-            self._connection_task = self.create_task(self._connection_task_handler(config=config))
+            # Start the connection. Bump the generation so any previously
+            # running (now superseded) connection task can detect that it is no
+            # longer current and refrain from triggering its own reconnect.
+            self._connection_generation += 1
+            generation = self._connection_generation
+            self._connection_task = self.create_task(
+                self._connection_task_handler(config=config, generation=generation)
+            )
 
         except Exception as e:
             await self.push_error(error_msg=f"Initialization error: {e}", exception=e)
 
-    async def _connection_task_handler(self, config: LiveConnectConfig):
+    async def _connection_task_handler(self, config: LiveConnectConfig, generation: int = 0):
         async with self._client.aio.live.connect(
             model=self._settings.model, config=config
         ) as session:
@@ -1410,7 +1421,15 @@ class GeminiLiveLLMService(LLMService):
 
             while True:
                 try:
-                    turn = self._session.receive()
+                    # Use the local `session` captured from the context manager
+                    # rather than `self._session`, which can be set to None by a
+                    # concurrent _disconnect()/_reconnect() and raise
+                    # "'NoneType' object has no attribute 'receive'".
+                    if self._connection_generation != generation:
+                        # A newer connection has superseded this task; stop
+                        # quietly without triggering a reconnect.
+                        return
+                    turn = session.receive()
                     async for message in turn:
                         # Reset failure counter if connection has been stable
                         self._check_and_reset_failure_counter()
@@ -1459,6 +1478,16 @@ class GeminiLiveLLMService(LLMService):
                         if message.session_resumption_update:
                             self._handle_msg_resumption_update(message)
                 except Exception as e:
+                    # If this task has been superseded by a newer connection
+                    # (e.g. a settings-change reconnect), do not attempt our own
+                    # reconnect — otherwise two reconnect chains race and emit a
+                    # continuous interruption storm that drops caller audio.
+                    if self._connection_generation != generation:
+                        logger.debug(
+                            "Ignoring connection error on superseded Gemini "
+                            f"connection (generation {generation}): {e}"
+                        )
+                        return
                     if not self._disconnecting:
                         should_reconnect = await self._handle_connection_error(e)
                         if should_reconnect:
