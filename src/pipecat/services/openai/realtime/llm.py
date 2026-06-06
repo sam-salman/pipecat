@@ -21,6 +21,7 @@ from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.adapters.services.open_ai_realtime_adapter import (
     OpenAIRealtimeLLMAdapter,
 )
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.frames.frames import (
     AggregationType,
     BotStoppedSpeakingFrame,
@@ -608,8 +609,25 @@ class OpenAIRealtimeLLMService(LLMService):
             # Send results for newly-completed function calls, if any.
             await self._process_completed_function_calls(send_new_results=True)
 
-    async def _handle_messages_append(self, frame):
-        logger.error("!!! NEED TO IMPLEMENT MESSAGES APPEND")
+    async def _handle_messages_append(self, frame: LLMMessagesAppendFrame):
+        """Append messages to the OpenAI Realtime session and optionally respond."""
+        if self._disconnecting or not self._websocket:
+            return
+        if not frame.messages:
+            return
+
+        context = LLMContext(messages=frame.messages)
+        adapter: OpenAIRealtimeLLMAdapter = self.get_llm_adapter()
+        llm_invocation_params = adapter.get_llm_invocation_params(
+            context, system_instruction=self._settings.system_instruction
+        )
+        for item in llm_invocation_params["messages"]:
+            evt = events.ConversationItemCreateEvent(item=item)
+            self._messages_added_manually[evt.item.id] = True
+            await self.send_client_event(evt)
+
+        if frame.run_llm:
+            await self._create_response()
 
     #
     # websocket communication
