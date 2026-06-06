@@ -519,9 +519,25 @@ class GrokRealtimeLLMService(LLMService):
             self._context = context
             await self._process_completed_function_calls(send_new_results=True)
 
-    async def _handle_messages_append(self, frame):
-        """Handle appending messages to the context."""
-        logger.warning("LLMMessagesAppendFrame not yet implemented for Grok Realtime")
+    async def _handle_messages_append(self, frame: LLMMessagesAppendFrame):
+        """Append messages to the Grok Realtime session and optionally respond."""
+        if self._disconnecting or not self._websocket:
+            return
+        if not frame.messages:
+            return
+
+        context = LLMContext(messages=frame.messages)
+        adapter: GrokRealtimeLLMAdapter = self.get_llm_adapter()
+        llm_invocation_params = adapter.get_llm_invocation_params(
+            context, system_instruction=self._settings.system_instruction
+        )
+        for item in llm_invocation_params["messages"]:
+            evt = events.ConversationItemCreateEvent(item=item)
+            self._messages_added_manually[evt.item.id] = True
+            await self.send_client_event(evt)
+
+        if frame.run_llm:
+            await self._create_response()
 
     #
     # WebSocket communication
@@ -641,7 +657,7 @@ class GrokRealtimeLLMService(LLMService):
             if evt.type == "ping":
                 # Ignore ping events (keep-alive)
                 pass
-            elif evt.type == "conversation.created":
+            elif evt.type in ("session.created", "conversation.created"):
                 await self._handle_evt_conversation_created(evt)
             elif evt.type == "session.updated":
                 await self._handle_evt_session_updated(evt)

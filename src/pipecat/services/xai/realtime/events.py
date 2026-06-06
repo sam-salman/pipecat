@@ -447,6 +447,16 @@ class SessionUpdatedEvent(ServerEvent):
     session: SessionProperties
 
 
+class SessionCreatedEvent(ServerEvent):
+    """Event indicating a realtime session has been created.
+
+    xAI's Voice Agent API emits this instead of ``conversation.created``.
+    """
+
+    type: Literal["session.created"]
+    session: Optional[SessionProperties] = None
+
+
 class ConversationCreated(ServerEvent):
     """Event indicating a conversation has been created.
 
@@ -827,6 +837,7 @@ class ErrorEvent(ServerEvent):
 _server_event_types = {
     "error": ErrorEvent,
     "ping": PingEvent,
+    "session.created": SessionCreatedEvent,
     "session.updated": SessionUpdatedEvent,
     "conversation.created": ConversationCreated,
     "conversation.item.added": ConversationItemAdded,
