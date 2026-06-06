@@ -6,6 +6,7 @@
 
 """OpenAI Realtime LLM service implementation with WebSocket support."""
 
+import audioop
 import base64
 import io
 import json
@@ -353,6 +354,25 @@ class OpenAIRealtimeLLMService(LLMService):
         self._register_event_handler("on_conversation_item_created")
         self._register_event_handler("on_conversation_item_updated")
         self._retrieve_conversation_item_futures = {}
+
+    def _configured_audio_format(self, direction: str) -> tuple[str, int]:
+        """Return (format_type, pipeline_sample_rate) for input or output audio."""
+        audio_cfg = self._settings.session_properties.audio
+        if not audio_cfg:
+            return "pcm", 24000
+
+        channel = audio_cfg.input if direction == "input" else audio_cfg.output
+        if not channel or not channel.format:
+            return "pcm", 24000
+
+        fmt = channel.format
+        if fmt.type == "audio/pcmu":
+            return "pcmu", 8000
+        if fmt.type == "audio/pcma":
+            return "pcma", 8000
+        if fmt.type == "audio/pcm":
+            return "pcm", getattr(fmt, "rate", 24000) or 24000
+        return "pcm", 24000
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate usage metrics.
@@ -811,9 +831,14 @@ class OpenAIRealtimeLLMService(LLMService):
             await self.push_frame(TTSStartedFrame())
         audio = base64.b64decode(evt.delta)
         self._current_audio_response.total_size += len(audio)
+        fmt_type, sample_rate = self._configured_audio_format("output")
+        if fmt_type == "pcmu":
+            audio = audioop.ulaw2lin(audio, 2)
+        elif fmt_type == "pcma":
+            audio = audioop.alaw2lin(audio, 2)
         frame = TTSAudioRawFrame(
             audio=audio,
-            sample_rate=24000,
+            sample_rate=sample_rate,
             num_channels=1,
         )
         await self.push_frame(frame)
@@ -1098,7 +1123,13 @@ class OpenAIRealtimeLLMService(LLMService):
             await self._create_response()
 
     async def _send_user_audio(self, frame):
-        payload = base64.b64encode(frame.audio).decode("utf-8")
+        audio = frame.audio
+        fmt_type, _ = self._configured_audio_format("input")
+        if fmt_type == "pcmu":
+            audio = audioop.lin2ulaw(audio, 2)
+        elif fmt_type == "pcma":
+            audio = audioop.lin2alaw(audio, 2)
+        payload = base64.b64encode(audio).decode("utf-8")
         await self.send_client_event(events.InputAudioBufferAppendEvent(audio=payload))
 
     async def _send_user_video(self, frame: InputImageRawFrame):
