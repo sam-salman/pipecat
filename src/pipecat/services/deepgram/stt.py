@@ -509,6 +509,10 @@ class DeepgramSTTService(STTService):
         self._connection_task = None
         self._quick_failure_tracker = QuickFailureTracker()
         self._connection_settled = asyncio.Event()
+        # A settings change mid-utterance used to reconnect immediately,
+        # dropping in-flight audio. Deferred here and applied once
+        # VADUserStoppedSpeakingFrame confirms the user isn't speaking.
+        self._reconnect_pending = False
 
         if self.vad_enabled:
             self._register_event_handler("on_speech_started")
@@ -532,7 +536,13 @@ class DeepgramSTTService(STTService):
         return True
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
-        """Apply a settings delta and reconnect if anything changed."""
+        """Apply a settings delta and reconnect if anything changed.
+
+        The new settings apply to self._settings immediately either way; only
+        the reconnect that makes them take effect on the live connection is
+        deferred while the user is speaking, so an update arriving mid-turn
+        doesn't drop in-flight audio.
+        """
         changed = await super()._update_settings(delta)
 
         if not changed:
@@ -543,8 +553,11 @@ class DeepgramSTTService(STTService):
             self._settings._sync_extra_to_fields()
 
         if self._connection:
-            await self._disconnect()
-            await self._connect()
+            if self._user_speaking:
+                self._reconnect_pending = True
+            else:
+                await self._disconnect()
+                await self._connect()
 
         return changed
 
@@ -852,3 +865,11 @@ class DeepgramSTTService(STTService):
                 self.request_finalize()
                 await self._connection.send_finalize(ListenV1Finalize(type="Finalize"))
                 logger.trace(f"Triggered finalize event on: {frame.name=}, {direction=}")
+
+            # Apply a settings-change reconnect deferred while the user was
+            # still speaking, now that they've stopped (self._user_speaking
+            # was already flipped to False by super().process_frame() above).
+            if self._reconnect_pending:
+                self._reconnect_pending = False
+                await self._disconnect()
+                await self._connect()
