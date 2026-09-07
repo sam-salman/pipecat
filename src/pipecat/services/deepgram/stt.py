@@ -712,11 +712,14 @@ class DeepgramSTTService(STTService):
                         msg = f"Deepgram rejected the connection (status {e.status_code}): {e}"
                         await self.push_error(error_msg=msg, exception=e, fatal=True)
                         return
+                    # Retryable: stays a log line, not a push_error. Zoren's
+                    # on_pipeline_error handler ends the call on ANY ErrorFrame,
+                    # fatal or not, so pushing one here would hang up on a
+                    # transient blip the retry loop below is about to recover
+                    # from -- exactly the outcome retrying exists to avoid.
                     logger.warning(f"{self}: Connection lost, will retry: {e}")
-                    await self.push_error(error_msg=f"connection error: {e}", exception=e)
                 except Exception as e:
                     logger.warning(f"{self}: Connection lost, will retry: {e}")
-                    await self.push_error(error_msg=f"connection error: {e}", exception=e)
                 finally:
                     self._connection = None
                     if keepalive_task:

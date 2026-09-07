@@ -106,6 +106,52 @@ async def test_repeated_quick_transient_failures_eventually_give_up():
     )
     # max_consecutive_failures=2 -> exactly 2 attempts before giving up.
     assert service._client.listen.v1.connect.call_count == 2
+    # Exactly one push_error total: the final give-up. Every retryable
+    # attempt before it must NOT call push_error.
+    assert len(pushed_errors) == 1, (
+        f"Expected only the final give-up to call push_error, got: {pushed_errors}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retryable_failure_does_not_push_error():
+    """A single transient failure must not push_error at all.
+
+    Zoren's on_pipeline_error handler ends the call on ANY ErrorFrame,
+    fatal or not (it doesn't check frame.fatal) -- so calling push_error on a
+    connection blip the retry loop is about to recover from would hang up
+    calls that should have survived. Bound the run to one retry attempt via
+    max_consecutive_failures=1 combined with a connect that starts succeeding
+    would require a real second attempt; instead assert directly on a single
+    failed attempt by cancelling the handler after it retries once.
+    """
+    service, pushed_errors = _make_service()
+    from pipecat.utils.network import QuickFailureTracker
+
+    # Never gives up quickly-failing connections (high threshold), so the
+    # handler is still in its "retrying" phase when we cancel it.
+    service._quick_failure_tracker = QuickFailureTracker(
+        min_stable_duration=100.0, max_consecutive_failures=1000
+    )
+
+    service._client = MagicMock()
+    service._client.listen.v1.connect = MagicMock(
+        return_value=_FailingConnectCM(ConnectionError("connection reset"))
+    )
+
+    task = service.create_task(service._connection_handler())
+    # Let a few retry attempts happen.
+    await asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert service._client.listen.v1.connect.call_count >= 1
+    assert pushed_errors == [], (
+        f"Expected no push_error calls while still retrying, got: {pushed_errors}"
+    )
 
 
 @pytest.mark.asyncio
