@@ -405,6 +405,7 @@ class BaseOutputTransport(FrameProcessor):
 
             # Buffer to keep track of incoming audio.
             self._audio_buffer = bytearray()
+            self._audio_buffer_cls: type = OutputAudioRawFrame
 
             # This will be used to resample incoming audio to the output sample rate.
             self._resampler = create_stream_resampler()
@@ -550,6 +551,7 @@ class BaseOutputTransport(FrameProcessor):
             )
 
             cls = type(frame)
+            self._audio_buffer_cls = cls
             self._audio_buffer.extend(resampled)
             while len(self._audio_buffer) >= self._audio_chunk_size:
                 chunk = cls(
@@ -592,9 +594,40 @@ class BaseOutputTransport(FrameProcessor):
         async def handle_sync_frame(self, frame: Frame):
             """Handle frames that need synchronized processing.
 
+            `handle_audio_frame` only queues complete `_audio_chunk_size`
+            chunks, so up to one chunk's worth of trailing audio can still be
+            sitting in `_audio_buffer` when a `TTSStoppedFrame` arrives. Flush
+            it first (padded to a full chunk with silence) so it plays before
+            playback stops, instead of being silently discarded when
+            `_bot_stopped_speaking` clears the buffer.
+
             Args:
                 frame: The frame to handle synchronously.
             """
+            if isinstance(frame, TTSStoppedFrame):
+                await self._enqueue_flushed_audio_buffer()
+            await self._audio_queue.put(frame)
+
+        async def _enqueue_flushed_audio_buffer(self):
+            """Pad any unsent trailing audio with silence and queue it for playback.
+
+            Turns whatever is left in `_audio_buffer` into a frame of the same
+            type (e.g. `TTSAudioRawFrame`) as the audio it was buffered from,
+            so it goes through the normal playback path in order relative to
+            whatever is queued right after it (e.g. a `TTSStoppedFrame`).
+            """
+            if not self._audio_buffer:
+                return
+
+            padding = bytes(self._audio_chunk_size - len(self._audio_buffer))
+            frame = self._audio_buffer_cls(
+                bytes(self._audio_buffer) + padding,
+                sample_rate=self._sample_rate,
+                num_channels=self._params.audio_out_channels,
+            )
+            frame.transport_destination = self._destination
+            self._audio_buffer = bytearray()
+
             await self._audio_queue.put(frame)
 
         async def handle_mixer_control_frame(self, frame: MixerControlFrame):
