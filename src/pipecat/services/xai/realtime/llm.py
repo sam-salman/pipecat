@@ -956,10 +956,17 @@ class GrokRealtimeLLMService(LLMService):
 
     async def _send_tool_result(self, tool_call_id: str, result: str):
         """Send a tool call result to Grok."""
+        # result can already be a string (a tool that returns plain text) or
+        # a dict/list/etc. (most Zoren tools return a dict). Unconditionally
+        # json.dumps()'ing it double-encoded the already-a-string case into a
+        # JSON string literal containing the escaped original content, so the
+        # model saw a garbled value instead of the tool result. Only encode
+        # when it isn't already a string.
+        output = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         item = events.ConversationItem(
             type="function_call_output",
             call_id=tool_call_id,
-            output=json.dumps(result, ensure_ascii=False),
+            output=output,
         )
         await self.send_client_event(events.ConversationItemCreateEvent(item=item))
 
