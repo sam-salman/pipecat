@@ -684,6 +684,12 @@ class PipelineTask(BasePipelineTask):
         if not self._cancelled:
             logger.debug(f"Cancelling pipeline task {self}")
             self._cancelled = True
+            # If StartFrame hasn't reached the sink yet, _process_push_queue is
+            # still blocked in _wait_for_pipeline_start and would never drain
+            # the CancelFrame queued below -- unblock it here so cancellation
+            # before startup completes doesn't hang forever.
+            if not self._pipeline_start_event.is_set():
+                self._pipeline_start_event.set()
             await self.queue_frame(CancelFrame(reason=reason))
 
     async def _create_tasks(self):
