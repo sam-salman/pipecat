@@ -345,6 +345,11 @@ class TTSService(AIService):
         # PTS of the last word frame pushed via _add_word_timestamps, used to assign
         # correct PTS to TTSStoppedFrame and LLMFullResponseEndFrame.
         self._word_last_pts: int = 0
+        # Whether the bot is currently speaking. Set on BotStartedSpeakingFrame,
+        # cleared on BotStoppedSpeakingFrame and InterruptionFrame. Used by
+        # _maybe_pause_frame_processing to avoid pausing when nothing would
+        # ever produce the BotStoppedSpeakingFrame needed to resume.
+        self._bot_speaking: bool = False
         self._llm_response_started: bool = False
         # LLMFullResponseEndFrames received in process_frame, keyed by the turn's
         # context_id, when push_text_frames is False. The shared
@@ -821,7 +826,11 @@ class TTSService(AIService):
                     )
                 delta = type(self._settings).from_mapping(frame.settings)
                 await self._update_settings(delta)
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+            await self.push_frame(frame, direction)
         elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
             await self._maybe_resume_frame_processing()
             await self.push_frame(frame, direction)
         else:
@@ -929,6 +938,7 @@ class TTSService(AIService):
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         self._processing_text = False
+        self._bot_speaking = False
         await self._text_aggregator.handle_interruption()
         for filter in self._text_filters:
             await filter.handle_interruption()
@@ -948,10 +958,37 @@ class TTSService(AIService):
         self._turn_context_id = None
         self._word_last_pts = 0
         self._create_audio_context_task()
+        # When pause_frame_processing=True, the process task may be blocked at
+        # __process_event.wait() because pause_processing_frames() was called
+        # after LLMFullResponseEndFrame and an UninterruptibleFrame was
+        # dequeued before the interrupt arrived. _start_interruption() in the
+        # base FrameProcessor class handles the common case (non-
+        # uninterruptible frames) by cancelling and recreating the process
+        # task, but when it detects an UninterruptibleFrame it only resets the
+        # queue, leaving the process task blocked. BotStoppedSpeakingFrame
+        # never arrives (no audio played), so we must resume here to prevent a
+        # permanent deadlock.
+        await self._maybe_resume_frame_processing()
 
     async def _maybe_pause_frame_processing(self):
-        if self._processing_text and self._pause_frame_processing:
-            await self.pause_processing_frames()
+        """Hold incoming frames until the audio for this turn has been played.
+
+        Pausing waits for the ``BotStoppedSpeakingFrame`` that follows playback,
+        so it is only taken while there is playback to wait for: the bot
+        speaking, or an audio context still open that may yet produce audio. A
+        turn with neither -- one whose contexts all completed in silence, or
+        whose playback finished before the turn's text ran out -- has nothing
+        left to resume it, and pausing would latch frame processing for good.
+        """
+        if not (self._processing_text and self._pause_frame_processing):
+            return
+
+        # With no audio playing or on its way, no BotStoppedSpeakingFrame is
+        # coming to lift the pause and it would latch for good.
+        if not (self._bot_speaking or self._audio_contexts):
+            return
+
+        await self.pause_processing_frames()
 
     async def _maybe_resume_frame_processing(self):
         if self._pause_frame_processing:
@@ -1549,8 +1586,13 @@ class InterruptibleTTSService(WebsocketTTSService):
         self._bot_speaking = False
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
+        # Captured before calling super(), which now also clears _bot_speaking
+        # as part of its own interruption handling (to unblock a possible
+        # pause_frame_processing deadlock) -- reading it after would always
+        # see False here.
+        should_reconnect = self._bot_speaking
         await super()._handle_interruption(frame, direction)
-        if self._bot_speaking:
+        if should_reconnect:
             await self._disconnect()
             await self._connect()
 
