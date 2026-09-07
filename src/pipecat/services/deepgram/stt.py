@@ -7,6 +7,7 @@
 """Deepgram speech-to-text service implementation."""
 
 import asyncio
+import time
 from dataclasses import dataclass, field, fields
 from typing import Any, AsyncGenerator, Optional
 
@@ -34,11 +35,13 @@ from pipecat.services.settings import (
 from pipecat.services.stt_latency import DEEPGRAM_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
+from pipecat.utils.network import QuickFailureTracker, exponential_backoff_time
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 
 try:
     from deepgram import AsyncDeepgramClient
+    from deepgram.core import ApiError
     from deepgram.core.events import EventType
     from deepgram.listen.v1.types import (
         ListenV1CloseStream,
@@ -504,6 +507,8 @@ class DeepgramSTTService(STTService):
 
         self._connection = None
         self._connection_task = None
+        self._quick_failure_tracker = QuickFailureTracker()
+        self._connection_settled = asyncio.Event()
 
         if self.vad_enabled:
             self._register_event_handler("on_speech_started")
@@ -648,7 +653,10 @@ class DeepgramSTTService(STTService):
 
     async def _connect(self):
         logger.debug("Connecting to Deepgram")
+        self._quick_failure_tracker.reset()
+        self._connection_settled.clear()
         self._connection_task = self.create_task(self._connection_handler())
+        await self._connection_settled.wait()
 
     async def _disconnect(self):
         if not self._connection_task:
@@ -669,32 +677,68 @@ class DeepgramSTTService(STTService):
     async def _connection_handler(self):
         """Manages the full WebSocket lifecycle inside a single async with block.
 
-        Reconnects automatically after transient errors. Exits cleanly when
-        the task is cancelled (i.e. on stop/cancel).
+        Reconnects automatically after an error, with exponential backoff
+        between attempts, and gives up once enough attempts in a row have
+        failed to produce a connection that stays up. A 4xx ``ApiError``
+        (e.g. an invalid API key rejected at the handshake) gives up at once,
+        since the SDK has already told us the request itself is bad. Either
+        way, giving up pushes a fatal error instead of retrying forever with
+        no one told the service is unusable. Exits cleanly when the task is
+        cancelled (i.e. on stop/cancel).
         """
-        while True:
-            connect_kwargs = self._build_connect_kwargs()
-            try:
-                async with self._client.listen.v1.connect(**connect_kwargs) as connection:
-                    self._connection = connection
-                    connection.on(EventType.MESSAGE, self._on_message)
-                    connection.on(EventType.ERROR, self._on_error)
+        try:
+            while True:
+                connect_kwargs = self._build_connect_kwargs()
+                keepalive_task = None
+                connected_at = None
+                try:
+                    async with self._client.listen.v1.connect(**connect_kwargs) as connection:
+                        connected_at = time.monotonic()
+                        self._connection = connection
+                        self._connection_settled.set()
+                        connection.on(EventType.MESSAGE, self._on_message)
+                        connection.on(EventType.ERROR, self._on_error)
 
-                    logger.debug(f"{self}: Websocket connection initialized")
+                        logger.debug(f"{self}: Websocket connection initialized")
 
-                    keepalive_task = self.create_task(
-                        self._keepalive_handler(), f"{self}::keepalive"
-                    )
-                    try:
+                        keepalive_task = self.create_task(
+                            self._keepalive_handler(), f"{self}::keepalive"
+                        )
                         await connection.start_listening()
-                    finally:
+                except asyncio.CancelledError:
+                    raise
+                except ApiError as e:
+                    if e.status_code is not None and 400 <= e.status_code < 500:
+                        msg = f"Deepgram rejected the connection (status {e.status_code}): {e}"
+                        await self.push_error(error_msg=msg, exception=e, fatal=True)
+                        return
+                    logger.warning(f"{self}: Connection lost, will retry: {e}")
+                    await self.push_error(error_msg=f"connection error: {e}", exception=e)
+                except Exception as e:
+                    logger.warning(f"{self}: Connection lost, will retry: {e}")
+                    await self.push_error(error_msg=f"connection error: {e}", exception=e)
+                finally:
+                    self._connection = None
+                    if keepalive_task:
                         await self.cancel_task(keepalive_task)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning(f"{self}: Connection lost, will retry: {e}")
-            finally:
-                self._connection = None
+
+                # How long the connection lasted, which is nothing at all when
+                # the handshake never completed. Timing the attempt instead
+                # would read a handshake that hangs before failing as a healthy
+                # connection and keep retrying it forever.
+                uptime = time.monotonic() - connected_at if connected_at is not None else 0.0
+                if self._quick_failure_tracker.record(uptime).should_give_up:
+                    msg = (
+                        "connection failed to stay up "
+                        f"{self._quick_failure_tracker.max_consecutive_failures} times in a row"
+                    )
+                    await self.push_error(error_msg=msg, fatal=True)
+                    return
+                await asyncio.sleep(exponential_backoff_time(self._quick_failure_tracker.count))
+        finally:
+            # Nothing further will be attempted, so whoever is waiting for the
+            # service to connect can stop waiting.
+            self._connection_settled.set()
 
     async def _keepalive_handler(self):
         """Periodically send KeepAlive frames to prevent server-side timeout.
