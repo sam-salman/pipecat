@@ -507,6 +507,10 @@ class ElevenLabsTTSService(WebsocketTTSService):
         self._receive_task = None
         self._keepalive_task = None
 
+        # Context IDs whose context-init has been sent, so the keepalive knows
+        # which contexts are safe to target.
+        self._context_init_sent: set = set()
+
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
 
@@ -676,6 +680,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
                 )
 
             # Set max websocket message size to 16MB for large audio responses
+            self._context_init_sent = set()
             self._websocket = await websocket_connect(
                 url, max_size=16 * 1024 * 1024, additional_headers={"xi-api-key": self._api_key}
             )
@@ -724,6 +729,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
                 )
             except Exception as e:
                 await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+        self._context_init_sent.discard(context_id)
         self._cumulative_time = 0.0
         self._partial_word = ""
         self._partial_word_start_time = 0.0
@@ -814,7 +820,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
             try:
                 if self._websocket and self._websocket.state is State.OPEN:
                     context_id = self.get_active_audio_context_id()
-                    if context_id:
+                    if context_id and context_id in self._context_init_sent:
                         # Send keepalive with context ID to keep the connection alive
                         keepalive_message = {
                             "text": "",
@@ -822,9 +828,14 @@ class ElevenLabsTTSService(WebsocketTTSService):
                         }
                         logger.trace(f"Sending keepalive for context {context_id}")
                     else:
-                        # It's possible to have a user interruption which clears the context
-                        # without generating a new TTS response. In this case, we'll just send
-                        # an empty message to keep the connection alive.
+                        # Either there's no active context (e.g. a user interruption
+                        # cleared it without generating a new TTS response), or the
+                        # active context's context-init (carrying voice_settings)
+                        # hasn't been sent yet -- targeting it now would make this
+                        # keepalive the context's first message, with no
+                        # voice_settings, and ElevenLabs would reject the later
+                        # context-init with a 1008 policy violation. A context-less
+                        # keepalive is sufficient either way.
                         keepalive_message = {"text": ""}
                         logger.trace("Sending keepalive without context")
                     await self._websocket.send(json.dumps(keepalive_message))
@@ -873,6 +884,11 @@ class ElevenLabsTTSService(WebsocketTTSService):
                             locator.model_dump()
                             for locator in self._pronunciation_dictionary_locators
                         ]
+                    # Mark before the await so a keepalive that interleaves right
+                    # here still sees this context as not-yet-initialized and
+                    # falls back to a context-less keepalive instead of racing
+                    # ahead of this context-init message.
+                    self._context_init_sent.add(context_id)
                     await self._websocket.send(json.dumps(msg))
                     logger.trace(f"Created new context {context_id}")
 
