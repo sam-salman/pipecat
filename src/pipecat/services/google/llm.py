@@ -10,6 +10,7 @@ This module provides Google Gemini integration for the Pipecat framework,
 including LLM services, context management, and message aggregation.
 """
 
+import asyncio
 import base64
 import io
 import json
@@ -794,6 +795,7 @@ class GoogleLLMService(LLMService):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_config: Optional[Dict[str, Any]] = None,
         http_options: Optional[HttpOptions] = None,
+        stream_idle_timeout_secs: Optional[float] = 20.0,
         **kwargs,
     ):
         """Initialize the Google LLM service.
@@ -820,6 +822,11 @@ class GoogleLLMService(LLMService):
             tools: List of available tools/functions.
             tool_config: Configuration for tool usage.
             http_options: HTTP options for the client.
+            stream_idle_timeout_secs: How long to wait for the next chunk of a
+                streamed response before giving up and firing
+                ``on_completion_timeout``. Guards against a stream that stalls
+                without closing, which would otherwise hang the turn
+                indefinitely. Set to None to disable.
             **kwargs: Additional arguments passed to parent class.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -869,6 +876,7 @@ class GoogleLLMService(LLMService):
         self._http_options = update_google_client_http_options(http_options)
         self._tools = tools
         self._tool_config = tool_config
+        self._stream_idle_timeout_secs = stream_idle_timeout_secs
 
         # Store pending function calls that need to be executed after TTS
         self._pending_function_calls = []
@@ -1105,7 +1113,28 @@ class GoogleLLMService(LLMService):
             )
 
             function_calls = []
-            async for chunk in response:
+            # A stream that stops producing chunks without closing (e.g. a stalled
+            # connection) would otherwise leave this loop -- and the turn -- open
+            # indefinitely, since the client applies no timeout of its own. Bound
+            # the wait for each next chunk instead of the response as a whole, so
+            # a slow but healthy stream is never cut short.
+            response_chunks = response.__aiter__()
+            while True:
+                try:
+                    if self._stream_idle_timeout_secs is None:
+                        chunk = await response_chunks.__anext__()
+                    else:
+                        chunk = await asyncio.wait_for(
+                            response_chunks.__anext__(),
+                            timeout=self._stream_idle_timeout_secs,
+                        )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as e:
+                    aclose = getattr(response, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+                    raise TimeoutError("Gemini stream stalled between chunks") from e
                 # Stop TTFB metrics after the first chunk
                 await self.stop_ttfb_metrics()
                 # Gemini may send usage_metadata in multiple chunks with varying behavior:
@@ -1271,7 +1300,7 @@ class GoogleLLMService(LLMService):
                 else:
                     logger.debug(f"{self}: Executing {len(function_calls)} function calls")
                     await self.run_function_calls(function_calls)
-        except DeadlineExceeded:
+        except (DeadlineExceeded, TimeoutError):
             await self._call_event_handler("on_completion_timeout")
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
