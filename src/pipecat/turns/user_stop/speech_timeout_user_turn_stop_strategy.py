@@ -15,6 +15,7 @@ from loguru import logger
 from pipecat.audio.vad.vad_analyzer import VAD_STOP_SECS
 from pipecat.frames.frames import (
     Frame,
+    InterimTranscriptionFrame,
     STTMetadataFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
@@ -109,6 +110,16 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
             await self._handle_vad_user_stopped_speaking(frame)
         elif isinstance(frame, TranscriptionFrame):
             await self._handle_transcription(frame)
+        elif isinstance(frame, InterimTranscriptionFrame):
+            # An interim means more transcription is still on the way, so an
+            # earlier finalized transcript no longer covers all of the user's
+            # speech. Without this, a transcript finalized during a pause too
+            # short for VAD to report a stop (and thus a new start, which is
+            # what normally clears the flag) would leave the flag stale and
+            # skip the STT-latency wait at the next VAD stop while the tail
+            # of the utterance is still in flight -- risking triggering the
+            # turn before that tail has been transcribed.
+            self._transcript_finalized = False
 
         return ProcessFrameResult.CONTINUE
 
