@@ -107,6 +107,17 @@ class BaseOutputTransport(FrameProcessor):
         """
         return self._audio_chunk_size
 
+    async def cleanup(self):
+        """Release resources held by each media sender.
+
+        Each MediaSender owns a worker thread for video-frame resizing.
+        Nothing else releases it -- without this, every output destination of
+        every call leaks one thread for as long as the process runs.
+        """
+        await super().cleanup()
+        for _, sender in self._media_senders.items():
+            await sender.cleanup()
+
     async def start(self, frame: StartFrame):
         """Start the output transport and initialize components.
 
@@ -512,6 +523,10 @@ class BaseOutputTransport(FrameProcessor):
             await self._cancel_audio_task()
             await self._cancel_clock_task()
             await self._cancel_video_task()
+
+        async def cleanup(self):
+            """Release the worker thread backing this sender's video resizing."""
+            self._executor.shutdown(wait=False)
 
         async def handle_interruptions(self, _: InterruptionFrame):
             """Handle interruption events by restarting tasks and clearing buffers.
