@@ -583,6 +583,9 @@ class LLMUserAggregator(LLMContextAggregator):
         await self._cleanup()
 
     async def _cleanup(self):
+        if self._vad_controller:
+            await self._vad_controller.cleanup()
+
         await self._user_turn_controller.cleanup()
         await self._user_idle_controller.cleanup()
 

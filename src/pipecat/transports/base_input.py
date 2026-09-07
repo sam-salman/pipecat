@@ -227,6 +227,19 @@ class BaseInputTransport(FrameProcessor):
 
         return self._params.turn_analyzer
 
+    async def cleanup(self):
+        """Release resources held by the VAD and turn analyzers.
+
+        Each analyzer owns a worker thread for blocking model inference.
+        Nothing else releases it -- without this, every session leaks one
+        thread per analyzer for as long as the process runs.
+        """
+        await super().cleanup()
+        if self._params.vad_analyzer:
+            await self._params.vad_analyzer.cleanup()
+        if self._params.turn_analyzer:
+            await self._params.turn_analyzer.cleanup()
+
     async def start(self, frame: StartFrame):
         """Start the input transport and initialize components.
 

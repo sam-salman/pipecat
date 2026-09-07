@@ -250,4 +250,4 @@ class VADAnalyzer(ABC):
         It waits for all currently executing event handler tasks to finish
         before returning.
         """
-        pass
+        self._executor.shutdown(wait=False)
