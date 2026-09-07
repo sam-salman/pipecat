@@ -169,3 +169,52 @@ async def test_connect_unblocks_once_settled_even_on_give_up():
     await asyncio.wait_for(service._connection_settled.wait(), timeout=5.0)
 
     await service._connection_task
+
+
+class _DelayedSuccessConnectCM:
+    """An async context manager that takes a moment to "connect", then yields
+    a fake connection and blocks (like a real websocket) until cancelled."""
+
+    def __init__(self, delay: float):
+        self._delay = delay
+
+    async def __aenter__(self):
+        await asyncio.sleep(self._delay)
+        connection = MagicMock()
+        connection.on = MagicMock()
+
+        async def _never_returns_until_cancelled():
+            await asyncio.Event().wait()
+
+        connection.start_listening = _never_returns_until_cancelled
+        connection.send_close_stream = AsyncMock()
+        return connection
+
+    async def __aexit__(self, *a):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_connect_does_not_return_before_connection_is_ready():
+    """_connect() must not return before self._connection is actually set.
+
+    Previously _connect() only scheduled the connection task and returned
+    immediately, so start() (which awaits _connect()) completed before the
+    handshake finished. Since audio only starts flowing once start() returns
+    for every processor in the pipeline, that race dropped the first word or
+    two of real audio arriving right as a call began.
+    """
+    service, _ = _make_service()
+
+    service._client = MagicMock()
+    service._client.listen.v1.connect = MagicMock(
+        return_value=_DelayedSuccessConnectCM(delay=0.2)
+    )
+
+    assert service._connection is None
+    await service._connect()
+    assert service._connection is not None, (
+        "_connect() returned before the connection was actually established"
+    )
+
+    await service._disconnect()
