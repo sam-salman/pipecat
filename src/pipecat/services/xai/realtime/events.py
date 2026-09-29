@@ -416,6 +416,22 @@ class ResponseCancelEvent(ClientEvent):
     type: Literal["response.cancel"] = "response.cancel"
 
 
+class ConversationItemTruncateEvent(ClientEvent):
+    """Event to truncate a previous assistant audio item.
+
+    Parameters:
+        type: Event type, always "conversation.item.truncate".
+        item_id: ID of the item to truncate.
+        content_index: Index of the content to truncate within the item.
+        audio_end_ms: End time in milliseconds for the truncated audio.
+    """
+
+    type: Literal["conversation.item.truncate"] = "conversation.item.truncate"
+    item_id: str
+    content_index: int
+    audio_end_ms: int
+
+
 #
 # Server Events (received from Grok)
 #

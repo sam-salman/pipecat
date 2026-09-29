@@ -371,10 +371,17 @@ class GrokRealtimeLLMService(LLMService):
         return False
 
     async def _handle_interruption(self):
-        """Handle user interruption of assistant speech."""
+        """Handle user interruption of assistant speech.
+
+        Always send ``response.cancel`` so in-flight assistant audio stops on
+        the wire promptly. When server VAD is off, also clear the input buffer
+        (manual turn mode owns commit/cancel). With server VAD on, leave the
+        input buffer intact so the interrupting user speech is not wiped.
+        """
         if not self._is_turn_detection_enabled():
             await self.send_client_event(events.InputAudioBufferClearEvent())
-            await self.send_client_event(events.ResponseCancelEvent())
+
+        await self.send_client_event(events.ResponseCancelEvent())
 
         await self._truncate_current_audio_response()
         await self.stop_all_metrics()
@@ -408,18 +415,37 @@ class GrokRealtimeLLMService(LLMService):
         return int(duration_seconds * 1000)
 
     async def _truncate_current_audio_response(self):
-        """Truncates the current audio response.
+        """Truncate the in-flight assistant audio item on the server and locally.
 
-        Note: Grok may not support truncation events like OpenAI.
-        This is a best-effort cleanup.
+        Sends ``conversation.item.truncate`` at the shorter of wall-clock elapsed
+        time and bytes received so conversation history matches what the user
+        heard. Failures are non-fatal — ``response.cancel`` still stops playback.
         """
         if not self._current_audio_response:
             return
 
         try:
+            current = self._current_audio_response
             self._current_audio_response = None
+
+            audio_duration_ms = self._calculate_audio_duration_ms(current.total_size)
+            elapsed_ms = int(time.time() * 1000 - current.start_time_ms)
+            truncate_ms = max(0, min(elapsed_ms, audio_duration_ms))
+
+            logger.trace(
+                f"Truncating audio: duration={audio_duration_ms}ms, "
+                f"elapsed={elapsed_ms}ms, truncate={truncate_ms}ms"
+            )
+
+            await self.send_client_event(
+                events.ConversationItemTruncateEvent(
+                    item_id=current.item_id,
+                    content_index=current.content_index,
+                    audio_end_ms=truncate_ms,
+                )
+            )
         except Exception as e:
-            logger.warning(f"Audio truncation cleanup failed (non-fatal): {e}")
+            logger.warning(f"Audio truncation failed (non-fatal): {e}")
 
     #
     # Standard AIService frame handling
@@ -696,9 +722,25 @@ class GrokRealtimeLLMService(LLMService):
             elif evt.type == "response.function_call_arguments.done":
                 await self._handle_evt_function_call_arguments_done(evt)
             elif evt.type == "error":
-                if evt.error.code in (
-                    "response_cancel_not_active",
-                    "conversation_already_has_active_response",
+                # Match Grok's actual codes/messages for cancel-not-active,
+                # already-active, and truncate races. Grok's error codes
+                # diverge from OpenAI's, so fall back to substring matching on
+                # the message text. Without this, the now-unconditional
+                # response.cancel on interruption ("Cancellation failed: no
+                # active response found") would fall through to
+                # _handle_evt_error + return: exiting the receive loop, and
+                # pushing an ErrorFrame that Zoren's on_pipeline_error handler
+                # turns into an ended call.
+                msg = (evt.error.message or "").lower()
+                if (
+                    evt.error.code
+                    in (
+                        "response_cancel_not_active",
+                        "conversation_already_has_active_response",
+                    )
+                    or "no active response" in msg
+                    or "already has an active response" in msg
+                    or "truncat" in msg
                 ):
                     logger.debug(f"{self} {evt.error.message}")
                 else:
